@@ -1,0 +1,397 @@
+以下是对 `MoveBase::doplanner()` 函数的详细注释：
+
+```cpp
+/**
+ * @brief 导航控制主循环函数
+ * 
+ * 该函数是导航系统的核心控制循环，负责：
+ * 1. 路径规划
+ * 2. 障碍物检测
+ * 3. 路径跟踪控制
+ * 4. 定点停车处理
+ * 5. 速度指令发布
+ */
+void MoveBase::doplanner()
+{
+  // 初始化ROS节点句柄
+  ros::NodeHandle n;
+  
+  // 设置控制循环频率为20Hz（50ms周期）
+  ros::Rate rate(20);
+  
+  // 声明变量
+  geometry_msgs::PoseStamped goal;          // 目标点
+  std::vector<geometry_msgs::PoseStamped> global_plan; // 全局路径
+  geometry_msgs::PoseStamped global_pose;   // 全局坐标系下的位姿
+  geometry_msgs::PoseStamped current_position; // 当前位置
+  geometry_msgs::Twist cmd_vel;             // 速度控制指令
+  
+  // 设置初始状态为控制模式
+  state_ = CONTROLLING;
+  
+  // 交通标志和停车点删除标志
+  int traffic_flag = 0;
+  int SP_deleted_flag = 0;
+  
+  // 主循环
+  while (n.ok())
+  {
+    // 处理ROS回调（单次）
+    ros::spinOnce();
+    
+    // 获取机器人在全局坐标系中的位姿
+    getRobotPose(global_pose, planner_costmap_ros_);
+    
+    // 更新当前位置
+    current_position = global_pose;
+    
+    // 地图保存功能
+    if (saveMapping)
+    {
+      printf("start save mapping\n");
+      
+      // 当移动距离超过2cm时记录位置
+      if (distance(current_position, last_pose) >= 0.02)
+      {
+        // 打开文件追加模式
+        fp = fopen(savePath.c_str(), "a");
+        
+        // 写入位置和姿态数据（x,y,z + 四元数）
+        fprintf(fp, "%.4lf,%.4lf,%.4lf,%.4lf,%.4lf,%.4lf,%.4lf,\n",
+                current_position.pose.position.x,
+                current_position.pose.position.y,
+                current_position.pose.position.z,
+                current_position.pose.orientation.x,
+                current_position.pose.orientation.y,
+                current_position.pose.orientation.z,
+                current_position.pose.orientation.w);
+        
+        // 关闭文件并更新最后记录的位置
+        fclose(fp);
+        last_pose = current_position;
+      }
+    }
+    // 导航模式
+    else
+    {
+      // 条件编译（确保以下代码被包含）
+      #if 1
+        // 更新当前定位信息并发布
+        currentlocation.x = current_position.pose.position.x;
+        currentlocation.y = current_position.pose.position.y;
+        double currentpose_yaw = tf2::getYaw(current_position.pose.orientation);
+        currentlocation.heading = currentpose_yaw;
+        hglocationpub.publish(currentlocation);
+        
+        // 清空全局路径
+        global_plan.clear();
+        
+        // 路径规划：从当前位置到目标点
+        if (!makePlan(current_position, goal, global_plan) || global_plan.empty())
+        {
+          // 规划失败警告
+          ROS_DEBUG_NAMED("move_base", "Failed to find a plan to point (%.2f, %.2f)", 
+                         goal.pose.position.x, goal.pose.position.y);
+          continue;  // 跳过本次循环
+        }
+        else  // 规划成功
+        {
+          // 检查当前状态是否为控制模式
+          if (state_ == CONTROLLING)
+          {
+            // 获取临时路径指针
+            std::vector<geometry_msgs::PoseStamped> *temp_plan = &global_plan;
+            
+            // 重置障碍物标志
+            foundObstacleFlag = 0;
+            float distance = 0.8;  // 初始障碍物距离
+            
+            // 障碍物检测（更新foundObstacleFlag和distance）
+            obstacleDetect(current_position, global_plan, &distance);
+            
+            // 检查路径点索引是否越界
+            if (road_points_index > stopPoints.size() || road_points_index > road_paths.size())
+            {
+              ROS_ERROR("move_base-->tc_->stopPoints or road_paths number error.");
+              publishZeroVelocity();  // 发布零速度
+              continue;
+            }
+            
+            /***********定点停车处理**********/
+            // 检测是否到达停车点
+            if (detectReachedGoal(current_position, stopPoints[road_points_index]))
+            {
+              // 停车操作
+              publishZeroVelocity();
+              printf("move_base-->reached stoppoint!!! %d\n", road_points_index);
+              
+              // 如果不是最后一个停车点，发布停车信号
+              if (!(road_points_index == stopPoints.size() - 1)) {
+                printf("move_base-->stop_point_signal_msg.data =1; \n");
+                stop_point_signal_msg.data = 1;
+                stop_point_signal.publish(stop_point_signal_msg);
+              }
+              
+              // 停车10秒
+              ros::Duration(10).sleep();
+              
+              // 更新索引和路径
+              SP_deleted_flag = 1;
+              road_points_index++;
+              roadPoints = road_paths[road_points_index];
+              new_plan = true;
+              
+              // 清除停车信号
+              stop_point_signal_msg.data = 0;
+              stop_point_signal.publish(stop_point_signal_msg);
+              
+              continue;  // 跳过本次循环
+            }
+            /***********定点停车处理结束**********/
+            
+            //----------------纯追踪算法----------------
+            // 强制使用纯追踪算法（注释此行可启用避障）
+            foundObstacleFlag = 2;
+            
+            // 当不需要避障时使用纯追踪算法
+            if (foundObstacleFlag != 1)
+            {
+              float pursuitSpeed;  // 追踪速度
+              
+              // 计算转向角度和速度
+              float tagetAngle = sLineControl(current_position, global_plan, &pursuitSpeed);
+              
+              // 设置速度指令
+              cmd_vel.linear.x = pursuitSpeed / 2;  // 线速度减半（安全措施）
+              cmd_vel.angular.z = tagetAngle;       // 转向角度
+              
+              // 如果在计算过程中检测到障碍物，停止前进
+              if (foundObstacleFlag == 1)
+              {
+                cmd_vel.linear.x = 0.0;
+              }
+              
+              // 发布速度指令
+              angle_pub.publish(cmd_vel);
+              
+              // 休眠等待
+              rate.sleep();
+              continue;
+            }
+            //----------------纯追踪算法结束----------------
+            
+            //----------------避障算法----------------
+            else  // 需要避障
+            {
+              // 更新路径信息
+              latest_plan_ = temp_plan;
+              last_valid_plan_ = ros::Time::now();
+              planning_retries_ = 0;
+              new_global_plan_ = true;
+              
+              // 设置路径到局部规划器
+              if (!tc_->setPlan(*latest_plan_))
+              {
+                ROS_ERROR("move_base-->tc_->setPlan error.");
+                
+                // 多次发布零速度确保停止
+                publishZeroVelocity();
+                ros::Duration(0.2).sleep();
+                publishZeroVelocity();
+                ros::Duration(0.2).sleep();
+                publishZeroVelocity();
+                ros::Duration(0.2).sleep();
+                publishZeroVelocity();
+                ros::Duration(0.2).sleep();
+                continue;
+              }
+              
+              // 计算速度指令
+              if (tc_->computeVelocityCommands(cmd_vel))
+              {
+                // 成功获取有效指令
+                ROS_DEBUG_NAMED("move_base", "Got a valid command from the local planner: %.3lf, %.3lf, %.3lf",
+                               cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.angular.z);
+                
+                // 更新最后有效控制时间
+                last_valid_control_ = ros::Time::now();
+                
+                // 发布速度指令
+                vel_pub_.publish(cmd_vel);
+                
+                // 重置恢复状态
+                if (recovery_trigger_ == CONTROLLING_R)
+                  recovery_index_ = 0;
+              }
+              else  // 无法找到有效路径
+              {
+                printf("The local planner could not find a valid plan.\n");
+                
+                // 计算尝试结束时间
+                ros::Time attempt_end = last_valid_control_ + ros::Duration(controller_patience_);
+                
+                // 检查是否超时
+                if (ros::Time::now() > attempt_end)
+                {
+                  // 进入障碍清除模式
+                  publishZeroVelocity();
+                  printf("zero vel because timeout2\n");
+                  recovery_trigger_ = CONTROLLING_R;
+                }
+              }
+            }
+          }
+        }
+      #endif
+    }
+    
+    // 控制循环休眠
+    rate.sleep();
+    
+    // 检查控制循环是否超时
+    if (rate.cycleTime() > ros::Duration(1 / controller_frequency_) && state_ == CONTROLLING)
+      ROS_WARN("Control loop missed its desired rate of %.4fHz... the loop actually took %.4f seconds",
+               controller_frequency_, rate.cycleTime().toSec());
+  }
+}
+```
+
+### 功能架构解析
+
+```mermaid
+graph TD
+A[开始] --> B[ROS初始化]
+B --> C[主循环]
+C --> D{地图保存模式?}
+D -->|是| E[记录位置数据]
+D -->|否| F[获取当前位置]
+F --> G[路径规划]
+G --> H{规划成功?}
+H -->|否| C
+H -->|是| I{控制模式?}
+I -->|是| J[障碍物检测]
+J --> K{到达停车点?}
+K -->|是| L[停车10秒]
+K -->|否| M{需要避障?}
+M -->|否| N[纯追踪控制]
+M -->|是| O[避障算法]
+N --> P[发布速度]
+O --> Q[发布速度]
+P --> C
+Q --> C
+L --> R[更新路径点]
+R --> C
+```
+
+### 关键功能模块
+
+1. **地图记录模式**：
+   - 当 `saveMapping` 激活时，记录机器人轨迹
+   - 每移动2cm记录一次位置和姿态
+   - 数据保存到指定路径的文件中
+
+2. **导航模式**：
+   - **定位发布**：发布当前位姿信息
+   - **路径规划**：调用 `makePlan` 生成全局路径
+   - **定点停车**：
+     * 检测是否到达预定停车点
+     * 停车10秒并发送信号
+     * 更新到下一段路径
+   - **控制策略选择**：
+     * 纯追踪算法（默认）
+     * 避障算法（当检测到障碍物时）
+
+3. **纯追踪控制**：
+   - 调用 `sLineControl` 计算转向角和速度
+   - 发布速度指令（线速度和角速度）
+   - 安全措施：速度减半处理
+
+4. **避障算法**：
+   - 设置路径到局部规划器
+   - 调用 `computeVelocityCommands` 生成避障指令
+   - 超时处理：当长时间无法找到路径时停止
+
+### 参数说明
+
+| 参数 | 值 | 说明 |
+|------|----|------|
+| 控制频率 | 20 Hz | 主循环运行频率 |
+| 记录阈值 | 0.02 m | 移动超过2cm才记录 |
+| 停车时间 | 10 s | 到达停车点的等待时间 |
+| 控制超时 | `controller_patience_` | 局部规划器超时阈值 |
+
+### 典型工作流程
+
+1. **初始化**：
+   - 设置控制状态为 `CONTROLLING`
+   - 启动20Hz控制循环
+
+2. **正常导航**：
+   ```cpp
+   while (n.ok()) {
+     获取当前位置
+     路径规划
+     障碍物检测
+     纯追踪控制
+     发布速度
+     休眠50ms
+   }
+   ```
+
+3. **到达停车点**：
+   - 停车10秒
+   - 发布停车信号
+   - 切换到下一段路径
+
+4. **遇到障碍物**：
+   - 切换到避障算法
+   - 局部规划器计算避障路径
+   - 发布避障速度指令
+
+### 改进建议
+
+1. **参数可配置化**：
+   ```cpp
+   // 在头文件中定义
+   double parking_duration_ = 10.0; // 停车时间
+   double mapping_threshold_ = 0.02; // 记录阈值
+   ```
+
+2. **安全增强**：
+   ```cpp
+   // 在纯追踪控制前增加安全距离检查
+   if (distance < 0.5) {
+     cmd_vel.linear.x *= 0.5; // 近距离减速
+   }
+   ```
+
+3. **状态机优化**：
+   ```cpp
+   // 使用枚举明确状态转换
+   enum State {
+     IDLE,
+     PLANNING,
+     TRACKING,
+     PARKING,
+     AVOIDING,
+     RECOVERY
+   };
+   ```
+
+4. **性能监控**：
+   ```cpp
+   // 添加ROS诊断消息
+   diagnostic_msgs::DiagnosticArray diag_array;
+   diag_array.header.stamp = ros::Time::now();
+   // ...添加性能指标...
+   diag_pub_.publish(diag_array);
+   ```
+
+5. **错误处理增强**：
+   ```cpp
+   // 当路径规划连续失败时进入恢复行为
+   if (plan_fail_count++ > 5) {
+     recovery_trigger_ = PLANNING_R;
+     executeRecoveryBehavior();
+   }
+   ```
