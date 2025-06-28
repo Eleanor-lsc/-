@@ -1,0 +1,376 @@
+#include "astar.h"
+#include <cassert>
+#include <cstring>
+#include <algorithm>
+#include "blockallocator.h"
+
+// 定义移动代价常量
+static const int kStepValue = 10;      // 直行移动一格的代价
+static const int kObliqueValue = 14;   // 斜线移动一格的代价（近似于√2*10）
+
+// 构造函数：初始化A*寻路器
+AStar::AStar(BlockAllocator *allocator)
+    : width_(0)               // 地图宽度初始化为0
+    , height_(0)              // 地图高度初始化为0
+    , allocator_(allocator)   // 内存分配器
+    , step_val_(kStepValue)   // 初始化直行代价
+    , oblique_val_(kObliqueValue) // 初始化斜线代价
+{
+    assert(allocator_ != nullptr);  // 确保分配器有效
+}
+
+// 析构函数：清理资源
+AStar::~AStar()
+{
+    clear();  // 调用清理函数
+}
+
+// 获取直行移动代价
+int AStar::get_step_value() const
+{
+    return step_val_;
+}
+
+// 获取斜线移动代价
+int AStar::get_oblique_value() const
+{
+    return oblique_val_;
+}
+
+// 设置直行移动代价
+void AStar::set_step_value(int value)
+{
+    step_val_ = value;
+}
+
+// 设置斜线移动代价
+void AStar::set_oblique_value(int value)
+{
+    oblique_val_ = value;
+}
+
+// 清理所有节点和状态
+void AStar::clear()
+{
+    size_t index = 0;
+    const size_t max_size = width_ * height_;  // 计算地图总格子数
+    
+    // 遍历所有格子，释放节点内存
+    while (index < max_size)
+    {
+        allocator_->free(mapping_[index++], sizeof(Node));
+    }
+    
+    open_list_.clear();          // 清空开放列表
+    can_pass_ = nullptr;         // 重置可通过性判断函数
+    width_ = height_ = 0;        // 重置地图尺寸
+}
+
+// 初始化寻路参数
+void AStar::init(const Params &param)
+{
+    width_ = param.width;        // 设置地图宽度
+    height_ = param.height;      // 设置地图高度
+    can_pass_ = param.can_pass;  // 设置可通过性判断函数
+    
+    // 重置节点映射数组
+    if (!mapping_.empty())
+    {
+        memset(&mapping_[0], 0, sizeof(Node*) * mapping_.size());
+    }
+    mapping_.resize(width_ * height_, nullptr);  // 调整映射数组大小并初始化为空
+}
+
+// 检查参数是否有效
+bool AStar::is_vlid_params(const AStar::Params &param)
+{
+    return (param.can_pass != nullptr   // 必须提供可通过性检测函数
+            && (param.width > 0 && param.height > 0)  // 地图尺寸必须有效
+            && (param.end.x >= 0 && param.end.x < param.width)   // 终点必须在边界内
+            && (param.end.y >= 0 && param.end.y < param.height)  // 终点必须在边界内
+            && (param.start.x >= 0 && param.start.x < param.width)   // 起点必须在边界内
+            && (param.start.y >= 0 && param.start.y < param.height)  // 起点必须在边界内
+            );
+}
+
+// 在开放列表中查找节点索引
+bool AStar::get_node_index(Node *node, size_t *index)
+{
+    *index = 0;
+    const size_t size = open_list_.size();
+    
+    // 线性遍历开放列表
+    while (*index < size)
+    {
+        if (open_list_[*index]->pos == node->pos)  // 比较位置坐标
+        {
+            return true;  // 找到节点
+        }
+        ++(*index);
+    }
+    return false;  // 未找到节点
+}
+
+// 二叉堆的上滤操作（维护最小堆性质）
+void AStar::percolate_up(size_t hole)
+{
+    size_t parent = 0;
+    while (hole > 0)  // 从当前位置向上调整
+    {
+        parent = (hole - 1) / 2;  // 计算父节点索引
+        
+        // 如果当前节点的f值小于父节点
+        if (open_list_[hole]->f() < open_list_[parent]->f())
+        {
+            std::swap(open_list_[hole], open_list_[parent]);  // 交换节点位置
+            hole = parent;  // 继续向上调整
+        }
+        else
+        {
+            return;  // 堆性质已满足，结束调整
+        }
+    }
+}
+
+// 计算G值（从起点到当前节点的实际代价）
+inline uint16_t AStar::calcul_g_value(Node *parent, const Vec2 &current)
+{
+    // 判断移动类型：斜线移动(距离为2)或直线移动(距离为1)
+    uint16_t g_value = current.distance(parent->pos) == 2 ? oblique_val_ : step_val_;
+    return g_value += parent->g;  // 累加父节点的G值
+}
+
+// 计算H值（当前节点到终点的启发式估值）
+inline uint16_t AStar::calcul_h_value(const Vec2 &current, const Vec2 &end)
+{
+    // 使用曼哈顿距离乘以基础代价作为启发值
+    unsigned int h_value = end.distance(current);
+    return h_value * step_val_;
+}
+
+// 检查节点是否在开放列表中
+inline bool AStar::in_open_list(const Vec2 &pos, Node *&out_node)
+{
+    out_node = mapping_[pos.y * width_ + pos.x];  // 通过映射获取节点
+    return out_node ? out_node->state == IN_OPENLIST : false;  // 检查节点状态
+}
+
+// 检查节点是否在关闭列表中
+inline bool AStar::in_closed_list(const Vec2 &pos)
+{
+    Node *node_ptr = mapping_[pos.y * width_ + pos.x];
+    return node_ptr ? node_ptr->state == IN_CLOSEDLIST : false;
+}
+
+// 检查指定位置是否可通过（边界检查）
+bool AStar::can_pass(const Vec2 &pos)
+{
+    // 检查位置是否在地图范围内
+    return (pos.x >= 0 && pos.x < width_ && pos.y >= 0 && pos.y < height_) 
+           ? can_pass_(pos) : false;  // 调用用户提供的可通过性函数
+}
+
+// 检查从当前位置到目标位置是否可通过（带碰撞检测）
+bool AStar::can_pass(const Vec2 &current, const Vec2 &destination, bool allow_corner)
+{
+    // 目标位置必须在边界内
+    if (destination.x >= 0 && destination.x < width_ && 
+        destination.y >= 0 && destination.y < height_)
+    {
+        // 目标位置不能在关闭列表中
+        if (in_closed_list(destination))
+        {
+            return false;
+        }
+
+        // 如果是相邻直线移动（非斜线）
+        if (destination.distance(current) == 1)
+        {
+            return can_pass_(destination);  // 直接检查目标位置
+        }
+        // 如果是斜线移动且允许拐角
+        else if (allow_corner)
+        {
+            // 需要同时检查目标位置和两个相邻位置（防止穿墙）
+            return can_pass_(destination) 
+                   && can_pass(Vec2(current.x + destination.x - current.x, current.y))
+                   && can_pass(Vec2(current.x, current.y + destination.y - current.y));
+        }
+    }
+    return false;  // 默认不可通过
+}
+
+// 查找当前节点周围可通过的相邻节点
+void AStar::find_can_pass_nodes(const Vec2 &current, bool corner, std::vector<Vec2> *out_lists)
+{
+    Vec2 destination;
+    int row_index = current.y - 1;
+    const int max_row = current.y + 1;
+    const int max_col = current.x + 1;
+
+    // 边界检查：确保行索引不越界
+    if (row_index < 0)
+    {
+        row_index = 0;
+    }
+    
+    // 遍历3x3邻域（当前节点周围的8个方向）
+    while (row_index <= max_row)
+    {
+        int col_index = current.x - 1;
+
+        // 边界检查：确保列索引不越界
+        if (col_index < 0)
+        {
+            col_index = 0;
+        }
+    
+        while (col_index <= max_col)
+        {
+            destination.reset(col_index, row_index);
+            // 跳过当前节点自身
+            if (destination != current)
+            {
+                // 检查是否可通过
+                if (can_pass(current, destination, corner))
+                {
+                    out_lists->push_back(destination);  // 添加到可通过列表
+                }
+            }
+            ++col_index;
+        }
+        ++row_index;
+    }
+}
+
+// 处理已存在于开放列表的节点
+void AStar::handle_found_node(Node *current, Node *destination)
+{
+    // 计算新的G值（经过当前节点的路径）
+    unsigned int g_value = calcul_g_value(current, destination->pos);
+    
+    // 如果新路径更优（代价更低）
+    if (g_value < destination->g)
+    {
+        destination->g = g_value;           // 更新G值
+        destination->parent = current;      // 更新父节点
+
+        size_t index = 0;
+        // 查找节点在开放列表中的位置
+        if (get_node_index(destination, &index))
+        {
+            percolate_up(index);  // 更新节点位置（维护堆结构）
+        }
+        else
+        {
+            assert(false);  // 理论上应该能找到节点
+        }
+    }
+}
+
+// 处理新发现的节点（不在开放列表中）
+void AStar::handle_not_found_node(Node *current, Node *destination, const Vec2 &end)
+{
+    destination->parent = current;  // 设置父节点
+    destination->h = calcul_h_value(destination->pos, end);  // 计算启发值
+    destination->g = calcul_g_value(current, destination->pos);  // 计算实际代价
+
+    // 在映射数组中注册节点
+    Node *&reference_node = mapping_[destination->pos.y * width_ + destination->pos.x];
+    reference_node = destination;
+    reference_node->state = IN_OPENLIST;  // 标记为在开放列表
+
+    // 将节点加入开放列表
+    open_list_.push_back(destination);
+    // 维护最小堆性质（f值最小的在堆顶）
+    std::push_heap(open_list_.begin(), open_list_.end(), [](const Node *a, const Node *b)->bool
+    {
+        return a->f() > b->f();  // 比较函数：a的f值 > b的f值
+    });
+}
+
+// 主寻路函数
+std::vector<AStar::Vec2> AStar::find(const Params &param)
+{
+    std::vector<Vec2> paths;  // 存储最终路径
+    
+    // 验证参数有效性
+    assert(is_vlid_params(param));
+    if (!is_vlid_params(param))
+    {
+        return paths;  // 参数无效返回空路径
+    }
+
+    // 初始化寻路器
+    init(param);
+    std::vector<Vec2> nearby_nodes;  // 临时存储相邻节点
+    nearby_nodes.reserve(param.corner ? 8 : 4);  // 预分配内存
+
+    // 创建起点节点（使用块分配器分配内存）
+    Node *start_node = new(allocator_->allocate(sizeof(Node))) Node(param.start);
+    open_list_.push_back(start_node);  // 加入开放列表
+    
+    // 在映射数组中注册起点
+    Node *&reference_node = mapping_[start_node->pos.y * width_ + start_node->pos.x];
+    reference_node = start_node;
+    reference_node->state = IN_OPENLIST;  // 标记为在开放列表
+
+    // 主寻路循环
+    while (!open_list_.empty())
+    {
+        // 获取f值最小的节点（堆顶元素）
+        Node *current = open_list_.front();
+        
+        // 从堆中移除当前节点
+        std::pop_heap(open_list_.begin(), open_list_.end(), [](const Node *a, const Node *b)->bool
+        {
+            return a->f() > b->f();
+        });
+        open_list_.pop_back();
+        
+        // 将当前节点移入关闭列表
+        mapping_[current->pos.y * width_ + current->pos.x]->state = IN_CLOSEDLIST;
+
+        // 检查是否到达终点
+        if (current->pos == param.end)
+        {
+            // 回溯构建路径
+            while (current->parent)
+            {
+                paths.push_back(current->pos);
+                current = current->parent;
+            }
+            std::reverse(paths.begin(), paths.end());  // 反转路径（起点到终点）
+            goto __end__;  // 跳转到清理环节
+        }
+
+        // 查找可通过的相邻节点
+        nearby_nodes.clear();
+        find_can_pass_nodes(current->pos, param.corner, &nearby_nodes);
+
+        // 处理所有相邻节点
+        size_t index = 0;
+        const size_t size = nearby_nodes.size();
+        while (index < size)
+        {
+            Node *next_node = nullptr;
+            // 检查节点是否已在开放列表
+            if (in_open_list(nearby_nodes[index], next_node))
+            {
+                handle_found_node(current, next_node);  // 更新已有节点
+            }
+            else
+            {
+                // 创建新节点（使用块分配器）
+                next_node = new(allocator_->allocate(sizeof(Node))) Node(nearby_nodes[index]);
+                handle_not_found_node(current, next_node, param.end);  // 加入开放列表
+            }
+            ++index;
+        }
+    }
+
+// 清理资源并返回路径
+__end__:
+    clear();  // 释放所有节点内存
+    return paths;
+}
