@@ -1,0 +1,207 @@
+#include "blockallocator.h"
+#include <limits.h>   // 提供UCHAR_MAX等常量
+#include <memory.h>   // 提供memset/memcpy函数
+#include <stddef.h>   // 提供size_t类型
+#include <malloc.h>   // 提供malloc/free函数
+#include <assert.h>   // 提供断言功能
+
+// 内存块结构（空闲链表节点）
+struct Block {
+    Block* next;  // 指向下一个空闲块的指针
+};
+
+// 大内存块结构（包含多个同规格小内存块）
+struct Chunk {
+    int block_size;  // 本Chunk中小内存块的大小
+    Block* blocks;   // 指向分配的内存区域首地址
+};
+
+// 预定义的块大小数组（单位：字节）
+int BlockAllocator::block_sizes_[kBlockSizes] = {
+    16, 32, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640
+};
+
+// 静态成员初始化
+bool BlockAllocator::s_block_size_lookup_initialized_;  // 块大小查找表是否初始化
+uint8_t BlockAllocator::s_block_size_lookup_[kMaxBlockSize + 1];  // 块大小映射表
+
+// 构造函数
+BlockAllocator::BlockAllocator() {
+    // 确保块类型数量不超过uint8_t表示范围
+    assert(kBlockSizes < UCHAR_MAX);
+    
+    // 初始化chunk数组
+    num_chunk_space_ = kChunkArrayIncrement;  // 初始容量
+    num_chunk_count_ = 0;                     // 当前使用量
+    chunks_ = (Chunk*)malloc(num_chunk_space_ * sizeof(Chunk));
+    
+    // 清零初始化
+    memset(chunks_, 0, num_chunk_space_ * sizeof(Chunk));
+    memset(free_lists_, 0, sizeof(free_lists_));
+    
+    // 初始化块大小查找表（只执行一次）
+    if (!s_block_size_lookup_initialized_) {
+        int j = 0;
+        // 遍历所有可能的内存申请大小（1~kMaxBlockSize）
+        for (int i = 1; i <= kMaxBlockSize; ++i) {
+            // 当i超过当前块规格时，移动到下一个更大的规格
+            if (i > block_sizes_[j]) {
+                ++j;
+                // 确保不会越界
+                assert(j < kBlockSizes);
+            }
+            // 建立映射：申请大小 -> 块规格索引
+            s_block_size_lookup_[i] = (uint8_t)j;
+        }
+        s_block_size_lookup_initialized_ = true;  // 标记已初始化
+    }
+}
+
+// 析构函数
+BlockAllocator::~BlockAllocator() {
+    // 释放所有Chunk中的大内存块
+    for (int i = 0; i < num_chunk_count_; ++i) {
+        ::free(chunks_[i].blocks);
+    }
+    // 释放Chunk数组
+    ::free(chunks_);
+}
+
+// 内存分配函数
+void* BlockAllocator::allocate(int size) {
+    // 处理无效请求
+    if (size == 0) return nullptr;
+    assert(size > 0);
+    
+    // 大内存直接使用系统分配
+    if (size > kMaxBlockSize) {
+        return malloc(size);
+    }
+    
+    // 通过查找表确定块规格索引
+    int index = s_block_size_lookup_[size];
+    assert(index >= 0 && index < kBlockSizes);
+    
+    // 情况1：空闲链表中有可用块
+    if (free_lists_[index]) {
+        Block* block = free_lists_[index];  // 获取链表头部块
+        free_lists_[index] = block->next;   // 链表指向下一块
+        return block;                       // 返回分配块
+    } 
+    // 情况2：需要分配新Chunk
+    else {
+        // 检查Chunk数组容量
+        if (num_chunk_count_ == num_chunk_space_) {
+            // 扩容策略：增加固定数量
+            Chunk* oldChunks = chunks_;
+            num_chunk_space_ += kChunkArrayIncrement;
+            
+            // 分配新数组并迁移数据
+            chunks_ = (Chunk*)malloc(num_chunk_space_ * sizeof(Chunk));
+            memcpy(chunks_, oldChunks, num_chunk_count_ * sizeof(Chunk));
+            memset(chunks_ + num_chunk_count_, 0, 
+                  kChunkArrayIncrement * sizeof(Chunk));
+            
+            ::free(oldChunks);  // 释放旧数组
+        }
+        
+        // 定位到新Chunk位置
+        Chunk* chunk = chunks_ + num_chunk_count_;
+        // 分配大内存块（尺寸kChunkSize）
+        chunk->blocks = (Block*)malloc(kChunkSize);
+        
+        // 调试模式填充特殊值（未初始化标记）
+#if defined(_DEBUG)
+        memset(chunk->blocks, 0xcd, kChunkSize);
+#endif
+        
+        // 设置块规格
+        int block_size = block_sizes_[index];
+        chunk->block_size = block_size;
+        
+        // 计算块数量
+        int block_count = kChunkSize / block_size;
+        assert(block_count * block_size <= kChunkSize);
+        
+        // 构建空闲链表（将大内存块分割为小内存块链表）
+        for (int i = 0; i < block_count - 1; ++i) {
+            // 计算当前块地址
+            Block* block = (Block*)((uint8_t*)chunk->blocks + block_size * i);
+            // 计算下一块地址
+            Block* next = (Block*)((uint8_t*)chunk->blocks + block_size * (i + 1));
+            block->next = next;  // 连接链表
+        }
+        // 设置链表末尾
+        Block* last = (Block*)((uint8_t*)chunk->blocks + block_size * (block_count - 1));
+        last->next = nullptr;
+        
+        // 更新空闲链表（跳过首块用于分配）
+        free_lists_[index] = chunk->blocks->next;
+        // 增加Chunk计数
+        ++num_chunk_count_;
+        
+        // 返回首个内存块（不放入空闲链表）
+        return chunk->blocks;
+    }
+}
+
+// 内存释放函数
+void BlockAllocator::free(void* p, int size) {
+    // 处理无效请求
+    if (!p || size == 0) return;
+    assert(size > 0);
+    
+    // 大内存直接释放
+    if (size > kMaxBlockSize) {
+        ::free(p);
+        return;
+    }
+    
+    // 获取块规格索引
+    int index = s_block_size_lookup_[size];
+    assert(index >= 0 && index < kBlockSizes);
+    
+    // 调试模式校验
+#ifdef _DEBUG
+    int block_size = block_sizes_[index];
+    bool found = false;
+    
+    // 验证指针是否属于本分配器
+    for (int i = 0; i < num_chunk_count_; ++i) {
+        Chunk* chunk = chunks_ + i;
+        // 跳过不同规格的Chunk
+        if (chunk->block_size != block_size) {
+            // 验证指针不在该Chunk范围内
+            assert((uint8_t*)p + block_size <= (uint8_t*)chunk->blocks ||
+                   (uint8_t*)chunk->blocks + kChunkSize <= (uint8_t*)p);
+        } 
+        // 检查同规格Chunk
+        else if ((uint8_t*)chunk->blocks <= (uint8_t*)p &&
+                (uint8_t*)p + block_size <= (uint8_t*)chunk->blocks + kChunkSize) {
+            found = true;  // 确认指针有效
+        }
+    }
+    assert(found);  // 必须找到所属Chunk
+    
+    // 填充特殊值（释放标记）
+    memset(p, 0xfd, block_size);
+#endif
+
+    // 将内存块插回空闲链表头部
+    Block* block = (Block*)p;
+    block->next = free_lists_[index];
+    free_lists_[index] = block;
+}
+
+// 清空所有内存
+void BlockAllocator::clear() {
+    // 释放所有Chunk中的大内存块
+    for (int i = 0; i < num_chunk_count_; ++i) {
+        ::free(chunks_[i].blocks);
+    }
+    
+    // 重置分配器状态
+    num_chunk_count_ = 0;
+    memset(chunks_, 0, num_chunk_space_ * sizeof(Chunk));
+    memset(free_lists_, 0, sizeof(free_lists_));
+}
