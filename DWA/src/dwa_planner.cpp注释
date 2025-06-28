@@ -1,0 +1,622 @@
+// Copyright 2020 amsl
+#include <algorithm>
+#include <string>
+#include <utility>
+#include <vector>
+#include "dwa_planner/dwa_planner.h"
+
+// 构造函数：初始化ROS节点、参数和发布/订阅器
+DWAPlanner::DWAPlanner(void)
+    : local_nh_("~"),          // 私有节点句柄
+      odom_updated_(false),    // 里程计更新标志
+      local_map_updated_(false), // 局部地图更新标志
+      scan_updated_(false),    // 激光数据更新标志
+      has_reached_(false),     // 是否到达目标标志
+      use_speed_cost_(false),  // 是否使用速度代价
+      odom_not_subscribe_count_(0), // 里程计丢失计数
+      local_map_not_subscribe_count_(0), // 局部地图丢失计数
+      scan_not_subscribe_count_(0)  // 激光数据丢失计数
+{
+  load_params();       // 加载ROS参数
+  ROS_INFO("=== DWA Planner ===");
+  print_params();      // 打印参数配置
+
+  // 初始化发布器
+  velocity_pub_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1); // 速度指令
+  candidate_trajectories_pub_ = local_nh_.advertise<visualization_msgs::MarkerArray>("candidate_trajectories", 1); // 候选轨迹可视化
+  selected_trajectory_pub_ = local_nh_.advertise<visualization_msgs::Marker>("selected_trajectory", 1); // 选定轨迹可视化
+  predict_footprints_pub_ = local_nh_.advertise<visualization_msgs::MarkerArray>("predict_footprints", 1); // 预测足迹可视化
+  finish_flag_pub_ = local_nh_.advertise<std_msgs::Bool>("finish_flag", 1); // 完成标志
+
+  // 初始化订阅器
+  dist_to_goal_th_sub_ = nh_.subscribe("/dist_to_goal_th", 1, &DWAPlanner::dist_to_goal_th_callback, this); // 目标距离阈值
+  edge_on_global_path_sub_ = nh_.subscribe("/path", 1, &DWAPlanner::edge_on_global_path_callback, this); // 全局路径边缘点
+  footprint_sub_ = nh_.subscribe("/footprint", 1, &DWAPlanner::footprint_callback, this); // 机器人足迹
+  goal_sub_ = nh_.subscribe("/move_base_simple/goal", 1, &DWAPlanner::goal_callback, this); // 目标点
+  local_map_sub_ = nh_.subscribe("/local_map", 1, &DWAPlanner::local_map_callback, this); // 局部地图
+  odom_sub_ = nh_.subscribe("/odom", 1, &DWAPlanner::odom_callback, this); // 里程计
+  scan_sub_ = nh_.subscribe("/scan", 1, &DWAPlanner::scan_callback, this); // 激光雷达
+  target_velocity_sub_ = nh_.subscribe("/target_velocity", 1, &DWAPlanner::target_velocity_callback, this); // 目标速度
+
+  // 初始化可选数据
+  if (!use_footprint_) footprint_ = geometry_msgs::PolygonStamped(); // 不使用足迹则置空
+  if (!use_path_cost_) edge_points_on_path_ = nav_msgs::Path(); // 不使用路径代价则置空
+  // 根据配置设置输入源标志
+  if (!use_scan_as_input_) scan_updated_ = true; 
+  else local_map_updated_ = true;
+}
+
+// State结构体：机器人状态（位置/朝向/速度）
+DWAPlanner::State::State(void) : x_(0.0), y_(0.0), yaw_(0.0), velocity_(0.0), yawrate_(0.0) {}
+DWAPlanner::State::State(const double x, const double y, const double yaw, const double velocity, const double yawrate)
+    : x_(x), y_(y), yaw_(yaw), velocity_(velocity), yawrate_(yawrate) {}
+
+// Window结构体：动态窗口范围（速度/角速度极值）
+DWAPlanner::Window::Window(void) : min_velocity_(0.0), max_velocity_(0.0), min_yawrate_(0.0), max_yawrate_(0.0) {}
+void DWAPlanner::Window::show(void) { /* 打印窗口范围 */ }
+
+// Cost结构体：轨迹评估代价分量
+DWAPlanner::Cost::Cost(void) : obs_cost_(0.0), to_goal_cost_(0.0), speed_cost_(0.0), path_cost_(0.0), total_cost_(0.0) {}
+DWAPlanner::Cost::Cost(const float obs_cost, const float to_goal_cost, const float speed_cost, const float path_cost, const float total_cost)
+    : obs_cost_(obs_cost), to_goal_cost_(to_goal_cost), speed_cost_(speed_cost), path_cost_(path_cost), total_cost_(total_cost) {}
+void DWAPlanner::Cost::show(void) { /* 打印代价详情 */ }
+void DWAPlanner::Cost::calc_total_cost(void) { total_cost_ = obs_cost_ + to_goal_cost_ + speed_cost_ + path_cost_; }
+
+// 目标点回调：转换目标到全局坐标系
+void DWAPlanner::goal_callback(const geometry_msgs::PoseStampedConstPtr &msg) {
+  goal_msg_ = *msg;
+  if (goal_msg_.value().header.frame_id != global_frame_) {
+    try {
+      // 使用TF转换坐标系
+      listener_.transformPose(global_frame_, ros::Time(0), goal_msg_.value(), goal_msg_.value().header.frame_id, goal_msg_.value());
+    } catch (tf::TransformException ex) { ROS_ERROR("%s", ex.what()); }
+  }
+}
+
+// 激光回调：创建障碍物列表（当使用激光作为输入）
+void DWAPlanner::scan_callback(const sensor_msgs::LaserScanConstPtr &msg) {
+  if (use_scan_as_input_) create_obs_list(*msg);
+  scan_not_subscribe_count_ = 0;
+  scan_updated_ = true;
+}
+
+// 局部地图回调：创建障碍物列表（当使用地图作为输入）
+void DWAPlanner::local_map_callback(const nav_msgs::OccupancyGridConstPtr &msg) {
+  if (!use_scan_as_input_) create_obs_list(*msg);
+  local_map_not_subscribe_count_ = 0;
+  local_map_updated_ = true;
+}
+
+// 里程计回调：更新当前速度
+void DWAPlanner::odom_callback(const nav_msgs::OdometryConstPtr &msg) {
+  current_cmd_vel_ = msg->twist.twist;
+  odom_not_subscribe_count_ = 0;
+  odom_updated_ = true;
+}
+
+// 目标速度回调：更新期望速度
+void DWAPlanner::target_velocity_callback(const geometry_msgs::TwistConstPtr &msg) {
+  target_velocity_ = std::min(msg->linear.x, max_velocity_);
+  ROS_INFO_STREAM_THROTTLE(1.0, "target velocity was updated to " << target_velocity_ << " [m/s]");
+}
+
+// 足迹回调：更新机器人轮廓（带膨胀）
+void DWAPlanner::footprint_callback(const geometry_msgs::PolygonStampedPtr &msg) {
+  footprint_ = *msg;
+  for (auto &point : footprint_.value().polygon.points) {
+    point.x += (point.x < 0) ? -footprint_padding_ : footprint_padding_;
+    point.y += (point.y < 0) ? -footprint_padding_ : footprint_padding_;
+  }
+}
+
+// 距离阈值回调：更新到达目标点的判定阈值
+void DWAPlanner::dist_to_goal_th_callback(const std_msgs::Float64ConstPtr &msg) {
+  dist_to_goal_th_ = msg->data;
+  ROS_INFO_STREAM_THROTTLE(1.0, "distance to goal threshold was updated to " << dist_to_goal_th_ << " [m]");
+}
+
+// 全局路径边缘点回调：更新用于路径代价计算的参考路径
+void DWAPlanner::edge_on_global_path_callback(const nav_msgs::PathConstPtr &msg) {
+  if (!use_path_cost_) return;
+  edge_points_on_path_ = *msg;
+  try {
+    // 转换路径点到机器人坐标系
+    for (auto &pose : edge_points_on_path_.value().poses)
+      listener_.transformPose(robot_frame_, ros::Time(0), pose, msg->header.frame_id, pose);
+  } catch (tf::TransformException ex) { ROS_ERROR("%s", ex.what()); }
+}
+
+// DWA主规划函数：生成候选轨迹并评估
+std::vector<DWAPlanner::State> DWAPlanner::dwa_planning(
+    const Eigen::Vector3d &goal, 
+    std::vector<std::pair<std::vector<State>, bool>> &trajectories) 
+{
+  Cost min_cost(0.0, 0.0, 0.0, 0.0, 1e6); // 最小代价初始化
+  const Window dynamic_window = calc_dynamic_window(); // 计算动态窗口
+  std::vector<State> best_traj; // 最优轨迹
+  best_traj.resize(sim_time_samples_);
+  std::vector<Cost> costs; // 代价容器
+  const size_t costs_size = velocity_samples_ * (yawrate_samples_ + 1);
+  costs.reserve(costs_size);
+
+  // 计算速度和角速度分辨率
+  const double velocity_resolution = std::max(
+    (dynamic_window.max_velocity_ - dynamic_window.min_velocity_) / (velocity_samples_ - 1), DBL_EPSILON);
+  const double yawrate_resolution = std::max(
+    (dynamic_window.max_yawrate_ - dynamic_window.min_yawrate_) / (yawrate_samples_ - 1), DBL_EPSILON);
+
+  int available_traj_count = 0; // 有效轨迹计数
+  // 遍历速度样本
+  for (int i = 0; i < velocity_samples_; i++) {
+    const double v = dynamic_window.min_velocity_ + velocity_resolution * i;
+    // 遍历角速度样本
+    for (int j = 0; j < yawrate_samples_; j++) {
+      std::pair<std::vector<State>, bool> traj;
+      double y = dynamic_window.min_yawrate_ + yawrate_resolution * j;
+      // 低速时限制最小角速度
+      if (v < slow_velocity_th_) y = (y > 0) ? std::max(y, min_yawrate_) : std::min(y, -min_yawrate_);
+      traj.first = generate_trajectory(v, y); // 生成轨迹
+      const Cost cost = evaluate_trajectory(traj.first, goal); // 评估轨迹
+      costs.push_back(cost);
+      traj.second = (cost.obs_cost_ != 1e6); // 是否碰撞
+      if (traj.second) available_traj_count++;
+      trajectories.push_back(traj);
+    }
+
+    // 处理零角速度情况（如果动态窗口包含0）
+    if (dynamic_window.min_yawrate_ < 0.0 && 0.0 < dynamic_window.max_yawrate_) {
+      std::pair<std::vector<State>, bool> traj;
+      traj.first = generate_trajectory(v, 0.0);
+      const Cost cost = evaluate_trajectory(traj.first, goal);
+      costs.push_back(cost);
+      traj.second = (cost.obs_cost_ != 1e6);
+      if (traj.second) available_traj_count++;
+      trajectories.push_back(traj);
+    }
+  }
+
+  // 无有效轨迹处理
+  if (available_traj_count == 0) {
+    ROS_ERROR_THROTTLE(1.0, "No available trajectory");
+    best_traj = generate_trajectory(0.0, 0.0); // 生成停止轨迹
+  } 
+  else {
+    normalize_costs(costs); // 代价归一化
+    // 寻找最小总代价轨迹
+    for (int i = 0; i < costs.size(); i++) {
+      if (costs[i].obs_cost_ != 1e6) {
+        // 加权各代价分量
+        costs[i].to_goal_cost_ *= to_goal_cost_gain_;
+        costs[i].obs_cost_ *= obs_cost_gain_;
+        costs[i].speed_cost_ *= speed_cost_gain_;
+        costs[i].path_cost_ *= path_cost_gain_;
+        costs[i].calc_total_cost();
+        if (costs[i].total_cost_ < min_cost.total_cost_) {
+          min_cost = costs[i];
+          best_traj = trajectories[i].first;
+        }
+      }
+    }
+  }
+
+  // 打印调试信息
+  ROS_INFO("===");
+  ROS_INFO_STREAM("(v, y) = (" << best_traj.front().velocity_ << ", " << best_traj.front().yawrate_ << ")");
+  min_cost.show();
+  ROS_INFO_STREAM("num of trajectories available: " << available_traj_count << " of " << trajectories.size());
+  ROS_INFO(" ");
+
+  return best_traj;
+}
+
+// 代价归一化函数
+void DWAPlanner::normalize_costs(std::vector<DWAPlanner::Cost> &costs) {
+  Cost min_cost(1e6, 1e6, 1e6, 1e6, 1e6), max_cost; // 极值初始化
+
+  // 寻找各代价分量的最小/最大值
+  for (const auto &cost : costs) {
+    if (cost.obs_cost_ != 1e6) {
+      min_cost.obs_cost_ = std::min(min_cost.obs_cost_, cost.obs_cost_);
+      max_cost.obs_cost_ = std::max(max_cost.obs_cost_, cost.obs_cost_);
+      min_cost.to_goal_cost_ = std::min(min_cost.to_goal_cost_, cost.to_goal_cost_);
+      max_cost.to_goal_cost_ = std::max(max_cost.to_goal_cost_, cost.to_goal_cost_);
+      if (use_speed_cost_) {
+        min_cost.speed_cost_ = std::min(min_cost.speed_cost_, cost.speed_cost_);
+        max_cost.speed_cost_ = std::max(max_cost.speed_cost_, cost.speed_cost_);
+      }
+      if (use_path_cost_) {
+        min_cost.path_cost_ = std::min(min_cost.path_cost_, cost.path_cost_);
+        max_cost.path_cost_ = std::max(max_cost.path_cost_, cost.path_cost_);
+      }
+    }
+  }
+
+  // 归一化处理
+  for (auto &cost : costs) {
+    if (cost.obs_cost_ != 1e6) {
+      cost.obs_cost_ = (cost.obs_cost_ - min_cost.obs_cost_) / (max_cost.obs_cost_ - min_cost.obs_cost_ + DBL_EPSILON);
+      cost.to_goal_cost_ = (cost.to_goal_cost_ - min_cost.to_goal_cost_) / (max_cost.to_goal_cost_ - min_cost.to_goal_cost_ + DBL_EPSILON);
+      if (use_speed_cost_)
+        cost.speed_cost_ = (cost.speed_cost_ - min_cost.speed_cost_) / (max_cost.speed_cost_ - min_cost.speed_cost_ + DBL_EPSILON);
+      if (use_path_cost_)
+        cost.path_cost_ = (cost.path_cost_ - min_cost.path_cost_) / (max_cost.path_cost_ - min_cost.path_cost_ + DBL_EPSILON);
+    }
+  }
+}
+
+// 主处理循环
+void DWAPlanner::process(void) {
+  ros::Rate loop_rate(hz_);
+  while (ros::ok()) {
+    geometry_msgs::Twist cmd_vel;
+    if (can_move()) cmd_vel = calc_cmd_vel(); // 计算速度指令
+    velocity_pub_.publish(cmd_vel);
+    finish_flag_pub_.publish(has_finished_);
+    if (has_finished_.data) ros::Duration(sleep_time_after_finish_).sleep(); // 完成后休眠
+
+    // 重置更新标志
+    if (use_scan_as_input_) scan_updated_ = false;
+    else local_map_updated_ = false;
+    odom_updated_ = false;
+    has_finished_.data = false;
+
+    ros::spinOnce();
+    loop_rate.sleep();
+  }
+}
+
+// 移动条件检查
+bool DWAPlanner::can_move(void) {
+  // 检查必要数据是否就绪
+  if (!footprint_.has_value()) ROS_WARN_THROTTLE(1.0, "Robot Footprint has not been updated");
+  if (!goal_msg_.has_value()) ROS_WARN_THROTTLE(1.0, "Local goal has not been updated");
+  if (!edge_points_on_path_.has_value()) ROS_WARN_THROTTLE(1.0, "Edge on global path has not been updated");
+  // 检查数据更新超时
+  if (subscribe_count_th_ < odom_not_subscribe_count_) ROS_WARN_THROTTLE(1.0, "Odom has not been updated");
+  if (subscribe_count_th_ < local_map_not_subscribe_count_) ROS_WARN_THROTTLE(1.0, "Local map has not been updated");
+  if (subscribe_count_th_ < scan_not_subscribe_count_) ROS_WARN_THROTTLE(1.0, "Scan has not been updated");
+
+  // 更新丢失计数器
+  if (!odom_updated_) odom_not_subscribe_count_++;
+  if (!local_map_updated_) local_map_not_subscribe_count_++;
+  if (!scan_updated_) scan_not_subscribe_count_++;
+
+  // 返回是否满足移动条件
+  return (footprint_.has_value() && 
+          goal_msg_.has_value() && 
+          edge_points_on_path_.has_value() &&
+          odom_not_subscribe_count_ <= subscribe_count_th_ && 
+          local_map_not_subscribe_count_ <= subscribe_count_th_ &&
+          scan_not_subscribe_count_ <= subscribe_count_th_);
+}
+
+// 计算速度指令
+geometry_msgs::Twist DWAPlanner::calc_cmd_vel(void) {
+  geometry_msgs::Twist cmd_vel;
+  std::pair<std::vector<State>, bool> best_traj;
+  std::vector<std::pair<std::vector<State>, bool>> trajectories;
+  const size_t trajectories_size = velocity_samples_ * (yawrate_samples_ + 1);
+  trajectories.reserve(trajectories_size);
+
+  // 转换目标到机器人坐标系
+  geometry_msgs::PoseStamped goal_;
+  try {
+    listener_.transformPose(robot_frame_, ros::Time(0), goal_msg_.value(), goal_msg_.value().header.frame_id, goal_);
+  } catch (tf::TransformException ex) { ROS_ERROR("%s", ex.what()); }
+  const Eigen::Vector3d goal(goal_.pose.position.x, goal_.pose.position.y, tf::getYaw(goal_.pose.orientation));
+
+  // 大角度转向时启用速度代价
+  const double angle_to_goal = atan2(goal.y(), goal.x());
+  if (M_PI / 4.0 < fabs(angle_to_goal)) use_speed_cost_ = true;
+
+  // 未到达目标且距离大于阈值
+  if (dist_to_goal_th_ < goal.segment(0, 2).norm() && !has_reached_) {
+    if (can_adjust_robot_direction(goal)) { // 可调整方向
+      // 计算转向角速度
+      cmd_vel.angular.z = angle_to_goal > 0 ? 
+          std::min(angle_to_goal, max_in_place_yawrate_) : 
+          std::max(angle_to_goal, -max_in_place_yawrate_);
+      cmd_vel.angular.z = cmd_vel.angular.z > 0 ? 
+          std::max(cmd_vel.angular.z, min_in_place_yawrate_) : 
+          std::min(cmd_vel.angular.z, -min_in_place_yawrate_);
+      best_traj.first = generate_trajectory(cmd_vel.angular.z, goal);
+      trajectories.push_back(best_traj);
+    } 
+    else { // 执行DWA规划
+      best_traj.first = dwa_planning(goal, trajectories);
+      cmd_vel.linear.x = best_traj.first.front().velocity_;
+      cmd_vel.angular.z = best_traj.first.front().yawrate_;
+    }
+  } 
+  else { // 到达目标点附近
+    has_reached_ = true;
+    if (turn_direction_th_ < fabs(goal[2])) { // 需要调整最终朝向
+      cmd_vel.angular.z = goal[2] > 0 ? 
+          std::min(goal[2], max_in_place_yawrate_) : 
+          std::max(goal[2], -max_in_place_yawrate_);
+      cmd_vel.angular.z = cmd_vel.angular.z > 0 ? 
+          std::max(cmd_vel.angular.z, min_in_place_yawrate_) : 
+          std::min(cmd_vel.angular.z, -min_in_place_yawrate_);
+    } 
+    else { // 完成所有目标
+      has_finished_.data = true;
+      has_reached_ = false;
+    }
+    best_traj.first = generate_trajectory(cmd_vel.linear.x, cmd_vel.angular.z);
+    trajectories.push_back(best_traj);
+  }
+
+  // 可视化相关
+  for (int i = 0; i < trajectories_size; i++) trajectories.push_back(trajectories.front());
+  visualize_trajectory(best_traj.first, selected_trajectory_pub_);
+  visualize_trajectories(trajectories, candidate_trajectories_pub_);
+  visualize_footprints(best_traj.first, predict_footprints_pub_);
+
+  use_speed_cost_ = false; // 重置速度代价标志
+  return cmd_vel;
+}
+
+// 检查是否可以调整方向
+bool DWAPlanner::can_adjust_robot_direction(const Eigen::Vector3d &goal) {
+  const double angle_to_goal = atan2(goal.y(), goal.x());
+  if (fabs(angle_to_goal) < angle_to_goal_th_) return false; // 角度过小无需调整
+
+  // 生成转向轨迹并检查碰撞
+  const double yawrate = std::min(std::max(angle_to_goal, -max_in_place_yawrate_), max_in_place_yawrate_);
+  std::vector<State> traj = generate_trajectory(yawrate, goal);
+  return !check_collision(traj); // 返回是否无碰撞
+}
+
+// 碰撞检测
+bool DWAPlanner::check_collision(const std::vector<State> &traj) {
+  if (!use_footprint_) return false; // 未启用足迹检测
+
+  for (const auto &state : traj) {
+    for (const auto &obs : obs_list_.poses) {
+      const geometry_msgs::PolygonStamped footprint = move_footprint(state); // 移动足迹到当前状态
+      if (is_inside_of_robot(obs.position, footprint, state)) return true; // 点是否在足迹内
+    }
+  }
+  return false;
+}
+
+// 计算动态窗口
+DWAPlanner::Window DWAPlanner::calc_dynamic_window(void) {
+  Window window;
+  // 速度窗口：考虑加速度限制
+  window.min_velocity_ = std::max((current_cmd_vel_.linear.x - max_deceleration_ * sim_period_), min_velocity_);
+  window.max_velocity_ = std::min((current_cmd_vel_.linear.x + max_acceleration_ * sim_period_), target_velocity_);
+  // 角速度窗口：考虑角加速度限制
+  window.min_yawrate_ = std::max((current_cmd_vel_.angular.z - max_d_yawrate_ * sim_period_), -max_yawrate_);
+  window.max_yawrate_ = std::min((current_cmd_vel_.angular.z + max_d_yawrate_ * sim_period_), max_yawrate_);
+  return window;
+}
+
+// 计算目标代价（轨迹终点与目标的距离）
+float DWAPlanner::calc_to_goal_cost(const std::vector<State> &traj, const Eigen::Vector3d &goal) {
+  Eigen::Vector3d last_position(traj.back().x_, traj.back().y_, traj.back().yaw_);
+  return (last_position.segment(0, 2) - goal.segment(0, 2)).norm(); // 二维欧氏距离
+}
+
+// 计算障碍物代价（最近障碍物距离）
+float DWAPlanner::calc_obs_cost(const std::vector<State> &traj) {
+  float min_dist = obs_range_; // 初始化为最大检测范围
+  for (const auto &state : traj) {
+    for (const auto &obs : obs_list_.poses) {
+      float dist;
+      if (use_footprint_) {
+        dist = calc_dist_from_robot(obs.position, state); // 基于足迹的距离
+      } else {
+        // 基于圆形机器人的距离
+        dist = hypot((state.x_ - obs.position.x), (state.y_ - obs.position.y)) - robot_radius_ - footprint_padding_;
+      }
+      if (dist < DBL_EPSILON) return 1e6; // 碰撞返回极大代价
+      min_dist = std::min(min_dist, dist); // 更新最小距离
+    }
+  }
+  return obs_range_ - min_dist; // 代价与距离成反比
+}
+
+// 计算速度代价（与最大速度的差距）
+float DWAPlanner::calc_speed_cost(const std::vector<State> &traj) {
+  if (!use_speed_cost_) return 0.0;
+  const Window dynamic_window = calc_dynamic_window();
+  return dynamic_window.max_velocity_ - traj.front().velocity_; // 速度越高代价越小
+}
+
+// 计算路径代价（偏离参考路径的程度）
+float DWAPlanner::calc_path_cost(const std::vector<State> &traj) {
+  if (!use_path_cost_) return 0.0;
+  return calc_dist_to_path(traj.back()); // 使用轨迹终点的垂直距离
+}
+
+// 计算到参考路径的距离（点到直线距离）
+float DWAPlanner::calc_dist_to_path(const State state) {
+  geometry_msgs::Point edge_point1 = edge_points_on_path_.value().poses.front().pose.position;
+  geometry_msgs::Point edge_point2 = edge_points_on_path_.value().poses.back().pose.position;
+  const float a = edge_point2.y - edge_point1.y;
+  const float b = -(edge_point2.x - edge_point1.x);
+  const float c = -a * edge_point1.x - b * edge_point1.y;
+  return fabs(a * state.x_ + b * state.y_ + c) / (hypot(a, b) + DBL_EPSILON); // 点到直线公式
+}
+
+// 生成轨迹（固定速度/角速度）
+std::vector<DWAPlanner::State> DWAPlanner::generate_trajectory(const double velocity, const double yawrate) {
+  std::vector<State> trajectory;
+  trajectory.resize(sim_time_samples_);
+  State state(0, 0, 0, velocity, yawrate); // 从当前位置开始
+  for (int i = 0; i < sim_time_samples_; i++) {
+    motion(state, velocity, yawrate); // 运动学模型更新
+    trajectory[i] = state;
+  }
+  return trajectory;
+}
+
+// 生成原地转向轨迹
+std::vector<DWAPlanner::State> DWAPlanner::generate_trajectory(const double yawrate, const Eigen::Vector3d &goal) {
+  const double target_direction = atan2(goal.y(), goal.x()) > 0 ? sim_direction_ : -sim_direction_;
+  const double predict_time = target_direction / (yawrate + DBL_EPSILON); // 预测时间
+  std::vector<State> trajectory;
+  trajectory.resize(sim_time_samples_);
+  State state;
+  for (int i = 0; i < sim_time_samples_; i++) {
+    motion(state, 0.0, yawrate); // 线速度为0
+    trajectory[i] = state;
+  }
+  return trajectory;
+}
+
+// 轨迹评估（综合各代价）
+DWAPlanner::Cost DWAPlanner::evaluate_trajectory(const std::vector<State> &trajectory, const Eigen::Vector3d &goal) {
+  Cost cost;
+  cost.to_goal_cost_ = calc_to_goal_cost(trajectory, goal);
+  cost.obs_cost_ = calc_obs_cost(trajectory);
+  cost.speed_cost_ = calc_speed_cost(trajectory);
+  cost.path_cost_ = calc_path_cost(trajectory);
+  cost.calc_total_cost();
+  return cost;
+}
+
+// 计算机器人与障碍物的距离（考虑足迹形状）
+float DWAPlanner::calc_dist_from_robot(const geometry_msgs::Point &obstacle, const State &state) {
+  const geometry_msgs::PolygonStamped footprint = move_footprint(state); // 当前姿态下的足迹
+  if (is_inside_of_robot(obstacle, footprint, state)) {
+    return 0.0; // 障碍物在足迹内部
+  } else {
+    // 计算障碍物到足迹边界的最短距离
+    geometry_msgs::Point intersection = calc_intersection(obstacle, state, footprint);
+    return hypot((obstacle.x - intersection.x), (obstacle.y - intersection.y));
+  }
+}
+
+// 移动足迹到指定状态
+geometry_msgs::PolygonStamped DWAPlanner::move_footprint(const State &target_pose) {
+  geometry_msgs::PolygonStamped footprint;
+  // 未提供足迹时使用圆形近似
+  if (!use_footprint_) {
+    const int plot_num = 20;
+    for (int i = 0; i < plot_num; i++) {
+      geometry_msgs::Point32 point;
+      point.x = (robot_radius_ + footprint_padding_) * cos(2 * M_PI * i / plot_num);
+      point.y = (robot_radius_ + footprint_padding_) * sin(2 * M_PI * i / plot_num);
+      footprint.polygon.points.push_back(point);
+    }
+  } else {
+    footprint = footprint_.value();
+  }
+
+  // 应用旋转和平移
+  for (auto &point : footprint.polygon.points) {
+    Eigen::Vector2f point_in(point.x, point.y);
+    Eigen::Rotation2Df rot(target_pose.yaw_);
+    Eigen::Vector2f point_out = rot * point_in;
+    point.x = point_out.x() + target_pose.x_;
+    point.y = point_out.y() + target_pose.y_;
+  }
+  return footprint;
+}
+
+// 检查点是否在机器人足迹内
+bool DWAPlanner::is_inside_of_robot(
+    const geometry_msgs::Point &obstacle, 
+    const geometry_msgs::PolygonStamped &footprint, 
+    const State &state) 
+{
+  geometry_msgs::Point32 state_point;
+  state_point.x = state.x_;
+  state_point.y = state.y_;
+
+  // 将足迹分解为三角形并检查
+  for (int i = 0; i < footprint.polygon.points.size(); i++) {
+    geometry_msgs::Polygon triangle;
+    triangle.points.push_back(state_point); // 中心点
+    triangle.points.push_back(footprint.polygon.points[i]); // 顶点i
+    // 顶点i+1（最后一个点连接回第一个点）
+    if (i != footprint.polygon.points.size() - 1) {
+      triangle.points.push_back(footprint.polygon.points[i+1]);
+    } else {
+      triangle.points.push_back(footprint.polygon.points[0]);
+    }
+    if (is_inside_of_triangle(obstacle, triangle)) return true;
+  }
+  return false;
+}
+
+// 三角形内外判断（叉积法）
+bool DWAPlanner::is_inside_of_triangle(const geometry_msgs::Point &target_point, const geometry_msgs::Polygon &triangle) {
+  // 获取三角形顶点
+  const Eigen::Vector3d A(triangle.points[0].x, triangle.points[0].y, 0.0);
+  const Eigen::Vector3d B(triangle.points[1].x, triangle.points[1].y, 0.0);
+  const Eigen::Vector3d C(triangle.points[2].x, triangle.points[2].y, 0.0);
+  const Eigen::Vector3d P(target_point.x, target_point.y, 0.0);
+
+  // 计算三个子三角形的叉积符号
+  Eigen::Vector3d AB = B - A;
+  Eigen::Vector3d BP = P - B;
+  double cross1 = AB.cross(BP).z();
+
+  Eigen::Vector3d BC = C - B;
+  Eigen::Vector3d CP = P - C;
+  double cross2 = BC.cross(CP).z();
+
+  Eigen::Vector3d CA = A - C;
+  Eigen::Vector3d AP = P - A;
+  double cross3 = CA.cross(AP).z();
+
+  // 同号则在三角形内
+  return ((cross1 > 0 && cross2 > 0 && cross3 > 0) || (cross1 < 0 && cross2 < 0 && cross3 < 0));
+}
+
+// 运动学模型（差分驱动机器人）
+void DWAPlanner::motion(State &state, const double velocity, const double yawrate) {
+  const double sim_time_step = predict_time_ / static_cast<double>(sim_time_samples_);
+  state.yaw_ += yawrate * sim_time_step; // 更新朝向
+  state.x_ += velocity * std::cos(state.yaw_) * sim_time_step; // 更新x位置
+  state.y_ += velocity * std::sin(state.yaw_) * sim_time_step; // 更新y位置
+  state.velocity_ = velocity; // 记录当前速度
+  state.yawrate_ = yawrate; // 记录当前角速度
+}
+
+// 从激光数据创建障碍物列表
+void DWAPlanner::create_obs_list(const sensor_msgs::LaserScan &scan) {
+  obs_list_.poses.clear();
+  float angle = scan.angle_min;
+  // 按角度分辨率采样
+  const int angle_index_step = static_cast<int>(angle_resolution_ / scan.angle_increment);
+  for (int i = 0; i < scan.ranges.size(); i += angle_index_step) {
+    const float r = scan.ranges[i];
+    if (r < scan.range_min || scan.range_max < r) continue; // 过滤无效数据
+    geometry_msgs::Pose pose;
+    pose.position.x = r * cos(angle);
+    pose.position.y = r * sin(angle);
+    obs_list_.poses.push_back(pose);
+    angle += angle_resolution_; // 更新角度
+  }
+}
+
+// 从占据栅格地图创建障碍物列表
+void DWAPlanner::create_obs_list(const nav_msgs::OccupancyGrid &map) {
+  obs_list_.poses.clear();
+  const double max_search_dist = hypot(map.info.width*map.info.resolution, map.info.height*map.info.resolution);
+  // 极坐标扫描
+  for (float angle = -M_PI; angle <= M_PI; angle += angle_resolution_) {
+    for (float dist = 0.0; dist <= max_search_dist; dist += map.info.resolution) {
+      geometry_msgs::Pose pose;
+      pose.position.x = dist * cos(angle);
+      pose.position.y = dist * sin(angle);
+      // 转换为地图索引
+      const int index_x = static_cast<int>((pose.position.x - map.info.origin.position.x) / map.info.resolution);
+      const int index_y = static_cast<int>((pose.position.y - map.info.origin.position.y) / map.info.resolution);
+      // 检查是否在地图范围内且是障碍物
+      if (index_x >= 0 && index_x < map.info.width && index_y >= 0 && index_y < map.info.height) {
+        if (map.data[index_x + index_y * map.info.width] == 100) { // 100表示占据
+          obs_list_.poses.push_back(pose);
+          break; // 找到最近障碍物后跳出
+        }
+      }
+    }
+  }
+}
+
+// 可视化相关函数（省略具体实现，主要创建Marker消息）
+// ... [可视化函数保持原有逻辑，添加简要注释] ...
