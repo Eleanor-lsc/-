@@ -1,0 +1,385 @@
+#include <iostream>
+#include <vector>
+#include <queue>
+#include <cmath>
+#include <map>
+#include <functional>
+#include <chrono>
+#include <thread>
+#include <memory>
+
+// 基础数据结构定义
+struct Point {
+    double x, y;
+    Point(double x = 0, double y = 0) : x(x), y(y) {}
+};
+
+struct Pose : Point {
+    double theta; // 朝向角
+    Pose(double x = 0, double y = 0, double theta = 0) : Point(x, y), theta(theta) {}
+};
+
+struct Velocity {
+    double v; // 线速度
+    double w; // 角速度
+    Velocity(double v = 0, double w = 0) : v(v), w(w) {}
+};
+
+struct PathPoint : Point {
+    std::string action; // 动作标记
+    PathPoint(double x, double y, std::string action = "") : Point(x, y), action(action) {}
+};
+
+// 多边形区域定义
+class Polygon {
+public:
+    std::vector<Point> vertices;
+    
+    Polygon(const std::vector<Point>& verts) : vertices(verts) {}
+    
+    bool contains(const Point& p) const {
+        // 实现点是否在多边形内的射线法判断
+        int n = vertices.size();
+        bool inside = false;
+        for (int i = 0, j = n-1; i < n; j = i++) {
+            if (((vertices[i].y > p.y) != (vertices[j].y > p.y)) &&
+                (p.x < (vertices[j].x - vertices[i].x) * (p.y - vertices[i].y) / 
+                        (vertices[j].y - vertices[i].y) + vertices[i].x)) {
+                inside = !inside;
+            }
+        }
+        return inside;
+    }
+};
+
+// 状态机枚举
+enum class RobotState {
+    GOING_TO_TARGET,    // 前往目标点
+    AT_SHOOTING_POINT,   // 到达打靶点
+    SHOOTING,            // 执行打靶动作
+    GOING_TO_START,      // 返回起点
+    MISSION_COMPLETE     // 任务完成
+};
+
+// A*算法实现
+class AStarPlanner {
+public:
+    struct Node {
+        Point point;
+        double g; // 从起点到当前节点的实际代价
+        double h; // 到目标的启发代价
+        double f() const { return g + h; }
+        Node* parent;
+        
+        Node(Point p, double g, double h, Node* parent = nullptr)
+            : point(p), g(g), h(h), parent(parent) {}
+        
+        // 用于优先队列的比较
+        bool operator>(const Node& other) const {
+            return f() > other.f();
+        }
+    };
+    
+    std::vector<Point> plan(const Point& start, const Point& goal, 
+                           const std::vector<Point>& obstacles) {
+        auto heuristic = [](const Point& a, const Point& b) {
+            return std::hypot(a.x - b.x, a.y - b.y);
+        };
+        
+        std::priority_queue<Node, std::vector<Node>, std::greater<Node>> openSet;
+        std::map<std::pair<double, double>, Node*> allNodes;
+        
+        Node* startNode = new Node(start, 0, heuristic(start, goal));
+        openSet.push(*startNode);
+        allNodes[{start.x, start.y}] = startNode;
+        
+        while (!openSet.empty()) {
+            Node current = openSet.top();
+            openSet.pop();
+            
+            // 找到目标
+            if (heuristic(current.point, goal) < 0.5) {
+                return reconstructPath(current);
+            }
+            
+            // 生成邻居节点 (简化版，实际应包含障碍物检查)
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    if (dx == 0 && dy == 0) continue;
+                    
+                    Point neighborPt(current.point.x + dx, current.point.y + dy);
+                    double newG = current.g + std::hypot(dx, dy);
+                    double newH = heuristic(neighborPt, goal);
+                    
+                    // 检查是否已存在
+                    auto key = std::make_pair(neighborPt.x, neighborPt.y);
+                    if (allNodes.find(key) != allNodes.end()) {
+                        Node* existing = allNodes[key];
+                        if (newG < existing->g) {
+                            existing->g = newG;
+                            existing->parent = &current;
+                        }
+                    } else {
+                        Node* newNode = new Node(neighborPt, newG, newH, &current);
+                        openSet.push(*newNode);
+                        allNodes[key] = newNode;
+                    }
+                }
+            }
+        }
+        
+        return {}; // 未找到路径
+    }
+    
+private:
+    std::vector<Point> reconstructPath(const Node& endNode) {
+        std::vector<Point> path;
+        const Node* current = &endNode;
+        while (current) {
+            path.push_back(current->point);
+            current = current->parent;
+        }
+        std::reverse(path.begin(), path.end());
+        return path;
+    }
+};
+
+// DWA控制器
+class DWAController {
+public:
+    Velocity computeVelocity(const Pose& currentPose, 
+                            const std::vector<Point>& globalPath,
+                            const std::vector<Point>& obstacles) {
+        // 简化实现 - 实际应包含完整的DWA算法
+        Velocity bestVel(0, 0);
+        double bestScore = -1e9;
+        
+        // 速度采样
+        for (double v = 0; v <= maxV; v += 0.1) {
+            for (double w = -maxW; w <= maxW; w += 0.1) {
+                // 模拟轨迹
+                auto traj = simulateTrajectory(currentPose, v, w);
+                
+                // 计算评分
+                double goalScore = evaluateGoal(traj, globalPath);
+                double obsScore = evaluateObstacle(traj, obstacles);
+                double velScore = evaluateVelocity(v, w);
+                
+                double totalScore = goalWeight * goalScore + 
+                                    obsWeight * obsScore + 
+                                    velWeight * velScore;
+                
+                if (totalScore > bestScore) {
+                    bestScore = totalScore;
+                    bestVel = {v, w};
+                }
+            }
+        }
+        return bestVel;
+    }
+
+private:
+    const double maxV = 1.0;     // 最大线速度
+    const double maxW = 1.0;     // 最大角速度
+    const double goalWeight = 0.6;
+    const double obsWeight = 0.3;
+    const double velWeight = 0.1;
+    
+    std::vector<Pose> simulateTrajectory(const Pose& start, double v, double w, double dt = 0.1, int steps = 10) {
+        std::vector<Pose> traj;
+        Pose current = start;
+        for (int i = 0; i < steps; i++) {
+            current.x += v * std::cos(current.theta) * dt;
+            current.y += v * std::sin(current.theta) * dt;
+            current.theta += w * dt;
+            traj.push_back(current);
+        }
+        return traj;
+    }
+    
+    double evaluateGoal(const std::vector<Pose>& traj, const std::vector<Point>& path) {
+        if (path.empty()) return 0;
+        // 计算轨迹终点到路径最近点的距离
+        double minDist = 1e9;
+        for (const auto& pt : path) {
+            double dist = std::hypot(traj.back().x - pt.x, traj.back().y - pt.y);
+            if (dist < minDist) minDist = dist;
+        }
+        return -minDist; // 距离越小评分越高
+    }
+    
+    double evaluateObstacle(const std::vector<Pose>& traj, const std::vector<Point>& obstacles) {
+        double minDist = 1e9;
+        for (const auto& pose : traj) {
+            for (const auto& obs : obstacles) {
+                double dist = std::hypot(pose.x - obs.x, pose.y - obs.y);
+                if (dist < minDist) minDist = dist;
+            }
+        }
+        return minDist; // 距离越大越安全
+    }
+    
+    double evaluateVelocity(double v, double w) {
+        return v; // 优先选择更高速度
+    }
+};
+
+// 机器人控制系统
+class RobotSystem {
+public:
+    RobotSystem(Point start, Point target, Polygon shootingZone)
+        : startPoint(start), targetPoint(target), shootingZone(shootingZone),
+          currentState(RobotState::GOING_TO_TARGET) {}
+    
+    void runMission() {
+        // 路径规划
+        AStarPlanner planner;
+        forwardPath = planWithActions(planner.plan(startPoint, targetPoint, {}), false);
+        returnPath = planWithActions(planner.plan(targetPoint, startPoint, {}), true);
+        
+        currentPath = forwardPath;
+        
+        // 主控制循环
+        while (currentState != RobotState::MISSION_COMPLETE) {
+            // 获取机器人状态 (模拟)
+            Pose currentPose = getCurrentPose();
+            std::vector<Point> obstacles = getObstacles();
+            
+            // 更新状态
+            updateState(currentPose);
+            
+            // 状态处理
+            switch (currentState) {
+                case RobotState::AT_SHOOTING_POINT:
+                    handleShootingPoint(currentPose);
+                    break;
+                    
+                case RobotState::SHOOTING:
+                    executeShooting();
+                    if (currentPath == forwardPath) {
+                        currentPath = returnPath;
+                        currentState = RobotState::GOING_TO_START;
+                    }
+                    break;
+                    
+                case RobotState::MISSION_COMPLETE:
+                    std::cout << "Mission complete!\n";
+                    break;
+                    
+                default: // GOING_TO_TARGET 和 GOING_TO_START
+                    Velocity cmdVel = dwa.computeVelocity(currentPose, currentPath, obstacles);
+                    sendVelocityCommand(cmdVel);
+                    break;
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+private:
+    Point startPoint;
+    Point targetPoint;
+    Polygon shootingZone;
+    RobotState currentState;
+    DWAController dwa;
+    std::vector<PathPoint> forwardPath;
+    std::vector<PathPoint> returnPath;
+    std::vector<PathPoint> currentPath;
+    
+    // 标记路径上的动作点
+    std::vector<PathPoint> planWithActions(const std::vector<Point>& path, bool isReturn) {
+        std::vector<PathPoint> result;
+        for (const auto& pt : path) {
+            if (shootingZone.contains(pt)) {
+                result.emplace_back(pt.x, pt.y, "shooting");
+            } else {
+                result.emplace_back(pt.x, pt.y);
+            }
+        }
+        return result;
+    }
+    
+    Pose getCurrentPose() {
+        // 实际应从传感器获取
+        return Pose(0, 0, 0); 
+    }
+    
+    std::vector<Point> getObstacles() {
+        // 实际应从传感器获取
+        return {}; 
+    }
+    
+    void updateState(const Pose& currentPose) {
+        // 简化实现 - 实际应有更精确的位置判断
+        if (currentState == RobotState::GOING_TO_TARGET) {
+            for (const auto& pt : currentPath) {
+                if (pt.action == "shooting" && 
+                    std::hypot(pt.x - currentPose.x, pt.y - currentPose.y) < 0.5) {
+                    currentState = RobotState::AT_SHOOTING_POINT;
+                    return;
+                }
+            }
+            if (std::hypot(targetPoint.x - currentPose.x, 
+                           targetPoint.y - currentPose.y) < 0.5) {
+                currentState = RobotState::GOING_TO_START;
+            }
+        }
+        // 其他状态转换类似...
+    }
+    
+    void handleShootingPoint(const Pose& currentPose) {
+        // 精确停靠逻辑
+        std::cout << "Precise positioning at shooting point\n";
+        // 实现精确停靠控制...
+        currentState = RobotState::SHOOTING;
+    }
+    
+    void executeShooting() {
+        std::cout << "Executing shooting sequence\n";
+        // 1. 锁定轮子
+        lockWheels();
+        
+        // 2. 执行打靶动作
+        aimAndFire();
+        
+        // 3. 解锁轮子
+        unlockWheels();
+        
+        std::cout << "Shooting complete\n";
+    }
+    
+    void sendVelocityCommand(const Velocity& vel) {
+        // 实际发送给电机控制器
+        std::cout << "Setting velocity: v=" << vel.v << ", w=" << vel.w << "\n";
+    }
+    
+    void lockWheels() {
+        std::cout << "Wheels locked\n";
+    }
+    
+    void unlockWheels() {
+        std::cout << "Wheels unlocked\n";
+    }
+    
+    void aimAndFire() {
+        // 实际控制机械臂
+        std::cout << "Aiming...\n";
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::cout << "Firing!\n";
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::cout << "Target hit\n";
+    }
+};
+
+int main() {
+    // 定义任务参数
+    Point start(0, 0);
+    Point target(10, 10);
+    Polygon shootingZone({{3,3}, {3,4}, {4,4}, {4,3}}); // 射击区域
+    
+    // 创建并运行机器人系统
+    RobotSystem robot(start, target, shootingZone);
+    robot.runMission();
+    
+    return 0;
+}
