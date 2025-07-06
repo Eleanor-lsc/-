@@ -1,0 +1,150 @@
+要将这段代码中的自主导航部分改为使用A*算法（全局规划）和DWA算法（局部规划），需要进行以下关键修改：
+
+### 1. 启用并配置A*全局规划器
+在构造函数中取消注释全局规划器的初始化代码，并修改为使用A*算法：
+
+```cpp
+// 修改参数读取和全局规划器初始化
+std::string global_planner;
+private_nh.param("base_global_planner", global_planner, std::string("global_planner/GlobalPlanner"));
+
+try {
+    planner_ = bgp_loader_.createInstance(global_planner);
+    planner_->initialize(bgp_loader_.getName(global_planner), planner_costmap_ros_);
+    
+    // 设置A*参数（可选）
+    ros::NodeHandle planner_nh("~/" + bgp_loader_.getName(global_planner));
+    planner_nh.setParam("use_dijkstra", false); // 使用A*而非Dijkstra
+    planner_nh.setParam("use_grid_path", true); // 使用网格路径
+} catch (const pluginlib::PluginlibException& ex) {
+    ROS_FATAL("Failed to create A* global planner: %s", ex.what());
+    exit(1);
+}
+```
+
+### 2. 确保使用DWA局部规划器
+确认局部规划器参数已设置为DWA（代码中已默认使用）：
+
+```cpp
+private_nh.param("base_local_planner", local_planner, std::string("dwa_local_planner/DWAPlannerROS"));
+```
+
+### 3. 修改路径规划逻辑
+重写`makePlan`函数，使用A*算法生成全局路径：
+
+```cpp
+bool MoveBase::makePlan(const geometry_msgs::PoseStamped& start,
+                        const geometry_msgs::PoseStamped& goal,
+                        std::vector<geometry_msgs::PoseStamped>& plan)
+{
+    plan.clear();
+    
+    // 使用A*全局规划器生成路径
+    if (!planner_->makePlan(start, goal, plan)) {
+        ROS_WARN("A* planner failed to find path");
+        return false;
+    }
+    
+    // 可视化发布路径
+    publishPlan(plan);
+    return true;
+}
+```
+
+### 4. 修改主导航循环
+在`doplanner()`函数中，使用A*生成的全局路径：
+
+```cpp
+void MoveBase::doplanner() {
+    // ... [其他代码不变] ...
+    while (n.ok()) {
+        // ... [其他代码不变] ...
+        
+        // 使用A*规划路径到当前目标点
+        geometry_msgs::PoseStamped goal = stopPoints[road_points_index];
+        global_plan.clear();
+        
+        if (!makePlan(current_position, goal, global_plan) || global_plan.empty()) {
+            ROS_WARN("Planning failed to goal %d", road_points_index);
+            continue;
+        }
+        
+        // 使用DWA进行局部路径跟踪
+        if (foundObstacleFlag == 1) {
+            // ... [DWA避障逻辑不变] ...
+        } else {
+            // ... [纯追踪逻辑] ...
+        }
+        
+        // ... [到达目标点检测] ...
+    }
+}
+```
+
+### 5. 参数文件配置
+在`move_base.yaml`中添加A*和DWA参数：
+
+```yaml
+# A* 参数
+base_global_planner: global_planner/GlobalPlanner
+GlobalPlanner:
+  use_dijkstra: false    # 使用A*
+  use_grid_path: true    # 网格路径
+  allow_unknown: true    # 允许未知区域
+
+# DWA 参数
+base_local_planner: dwa_local_planner/DWAPlannerROS
+DWAPlannerROS:
+  max_vel_x: 0.8
+  min_vel_x: -0.2
+  acc_lim_x: 2.5
+  # ... [其他DWA参数] ...
+```
+
+### 关键修改说明：
+
+1. **全局规划器切换**：
+   - 使用`global_planner/GlobalPlanner`并设置`use_dijkstra=false`启用A*
+   - 移除原有基于录制路径的规划逻辑
+
+2. **路径生成**：
+   - 直接调用A*规划器的`makePlan()`方法
+   - 生成的路径包含从当前位置到目标点的完整路径
+
+3. **导航流程**：
+   ```mermaid
+   graph TD
+   A[获取当前位置] --> B{A*全局规划}
+   B -->|成功| C[DWA局部跟踪]
+   B -->|失败| D[错误处理]
+   C --> E{到达目标点?}
+   E -->|是| F[切换下一目标]
+   E -->|否| A
+   ```
+
+4. **保留功能**：
+   - 停车点检测逻辑保持不变
+   - 避障切换机制（A*全局重规划 + DWA局部避障）
+   - 地图保存等辅助功能
+
+### 注意事项：
+
+1. **代价地图配置**：
+   - 确保`global_costmap`和`local_costmap`正确配置
+   - A*依赖全局代价地图，DWA依赖局部代价地图
+
+2. **性能考虑**：
+   - 大型环境中A*规划较慢，需添加规划频率控制
+   - 可添加路径缓存机制避免重复规划
+
+3. **路径平滑**：
+   ```cpp
+   // 添加路径平滑处理（可选）
+   nav_core::BaseGlobalPlanner::smoothPath(plan);
+   ```
+
+4. **异常处理**：
+   - 添加规划超时检测
+   - 规划失败时触发恢复行为
+
+这些修改将导航系统转换为标准的A* + DWA架构，同时保留了原有的停车点检测、避障切换等业务逻辑。
