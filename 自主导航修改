@@ -83,14 +83,13 @@ void MoveBase::doplanner() {
 
 ### 5. 参数文件配置
 在`move_base.yaml`中添加A*和DWA参数：
-
-```yaml
 # A* 参数
-base_global_planner: global_planner/GlobalPlanner
-GlobalPlanner:
+base_global_planner: navfn/NavfnROS
+NavfnROS:
   use_dijkstra: false    # 使用A*
-  use_grid_path: true    # 网格路径
   allow_unknown: true    # 允许未知区域
+  planner_window_x: 5.0  # 规划窗口大小
+  planner_window_y: 5.0
 
 # DWA 参数
 base_local_planner: dwa_local_planner/DWAPlannerROS
@@ -98,8 +97,9 @@ DWAPlannerROS:
   max_vel_x: 0.8
   min_vel_x: -0.2
   acc_lim_x: 2.5
-  # ... [其他DWA参数] ...
-```
+  max_rot_vel: 1.0
+  min_rot_vel: -1.0
+  acc_lim_theta: 3.2
 
 ### 关键修改说明：
 
