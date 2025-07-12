@@ -52,34 +52,7 @@ bool MoveBase::makePlan(const geometry_msgs::PoseStamped& start,
 ```
 
 ### 4. 修改主导航循环
-在`doplanner()`函数中，使用A*生成的全局路径：
 
-```cpp
-void MoveBase::doplanner() {
-    // ... [其他代码不变] ...
-    while (n.ok()) {
-        // ... [其他代码不变] ...
-        
-        // 使用A*规划路径到当前目标点
-        geometry_msgs::PoseStamped goal = stopPoints[road_points_index];
-        global_plan.clear();
-        
-        if (!makePlan(current_position, goal, global_plan) || global_plan.empty()) {
-            ROS_WARN("Planning failed to goal %d", road_points_index);
-            continue;
-        }
-        
-        // 使用DWA进行局部路径跟踪
-        if (foundObstacleFlag == 1) {
-            // ... [DWA避障逻辑不变] ...
-        } else {
-            // ... [纯追踪逻辑] ...
-        }
-        
-        // ... [到达目标点检测] ...
-    }
-}
-```
 
 ### 5. 参数文件配置
 在`move_base.yaml`中添加A*和DWA参数：
