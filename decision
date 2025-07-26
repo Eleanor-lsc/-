@@ -1,0 +1,278 @@
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <atomic>
+
+// 机器人状态枚举
+enum class RobotState {
+    INITIAL,
+    MOVING_TO_SUPPLY,
+    SHOOTING,
+    OCCUPYING_SUPPLY,
+    RETURNING_HOME,
+    ATTACKING,
+    DEFENDING
+};
+
+// 位置结构体
+struct Position {
+    double x;
+    double y;
+    
+    Position(double x = 0.0, double y = 0.0) : x(x), y(y) {}
+    
+    bool operator==(const Position& other) const {
+        return std::abs(x - other.x) < 0.1 && std::abs(y - other.y) < 0.1;
+    }
+};
+
+// 物资点类
+class SupplyPoint {
+public:
+    int id;
+    Position position;
+    bool occupied;
+    
+    SupplyPoint(int id, Position pos) : id(id), position(pos), occupied(false) {}
+};
+
+// 系统状态类
+class SystemStatus {
+public:
+    std::atomic<int> occupied_count{0};
+    std::atomic<int> robot_hp{3};  // 初始血量
+    std::atomic<bool> enemy_detected{false};
+    std::atomic<bool> at_shooting_spot{false};
+    std::atomic<bool> at_supply_point{false};
+    std::atomic<bool> at_home{true};
+};
+
+// 决策状态机类
+class DecisionStateMachine {
+private:
+    RobotState current_state;
+    std::vector<SupplyPoint> supply_points;
+    Position shooting_spot;
+    Position home_position;
+    int current_target_idx;
+    SystemStatus status;
+    std::mutex state_mutex;
+    
+    // 模拟移动函数
+    bool move_base(const Position& target) {
+        std::cout << "Moving to position: (" << target.x << ", " << target.y << ")\n";
+        // 在实际系统中，这里会调用真正的移动控制
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        return true;
+    }
+    
+    // 模拟打靶函数
+    bool perform_shooting() {
+        std::cout << "Performing shooting action\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        return true;
+    }
+    
+    // 占领物资点函数
+    bool occupy_supply(int supply_id) {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        std::cout << "Occupying supply point " << supply_id << "\n";
+        supply_points[supply_id].occupied = true;
+        status.occupied_count++;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        return true;
+    }
+    
+    // 攻击敌方函数
+    bool attack_enemy() {
+        std::cout << "Attacking enemy!\n";
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        return true;
+    }
+    
+    // 躲避敌方函数
+    bool evade_enemy() {
+        std::cout << "Evading enemy vehicle\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        return true;
+    }
+    
+    // 更新传感器状态（模拟）
+    void update_sensors() {
+        // 在实际系统中，这里会从传感器获取实时数据
+        // 模拟到达打靶点（假设第二个物资点是打靶点）
+        status.at_shooting_spot = (current_target_idx == 1);
+        
+        // 模拟敌人检测（当占领过半时更容易检测到敌人）
+        status.enemy_detected = (status.occupied_count >= 2);
+        
+        // 模拟到达物资点（简化处理，总是假设到达）
+        status.at_supply_point = true;
+        
+        // 模拟返回起点（简化处理）
+        status.at_home = (current_target_idx == 0);
+    }
+
+public:
+    DecisionStateMachine() 
+        : current_state(RobotState::INITIAL),
+          shooting_spot(2.5, 3.5),
+          home_position(0.0, 0.0),
+          current_target_idx(0) {
+        
+        // 初始化四个物资点
+        supply_points.emplace_back(0, Position(1.0, 2.0));
+        supply_points.emplace_back(1, Position(3.0, 4.0));
+        supply_points.emplace_back(2, Position(5.0, 6.0));
+        supply_points.emplace_back(3, Position(7.0, 8.0));
+    }
+    
+    void run_cycle() {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        update_sensors();
+        
+        // 状态转移逻辑
+        switch (current_state) {
+            case RobotState::INITIAL:
+                std::cout << "State: INITIAL → Starting mission\n";
+                current_state = RobotState::MOVING_TO_SUPPLY;
+                current_target_idx = 0;
+                break;
+                
+            case RobotState::MOVING_TO_SUPPLY: {
+                Position target_pos = supply_points[current_target_idx].position;
+                
+                if (status.at_shooting_spot) {
+                    std::cout << "State: MOVING_TO_SUPPLY → Detected shooting spot\n";
+                    current_state = RobotState::SHOOTING;
+                } else {
+                    std::cout << "State: MOVING_TO_SUPPLY → Heading to supply " 
+                              << current_target_idx << "\n";
+                    move_base(target_pos);
+                    
+                    // 检查是否到达物资点
+                    if (status.at_supply_point) {
+                        current_state = RobotState::OCCUPYING_SUPPLY;
+                    }
+                }
+                break;
+            }
+                
+            case RobotState::SHOOTING:
+                std::cout << "State: SHOOTING → Performing shooting action\n";
+                perform_shooting();
+                current_state = RobotState::MOVING_TO_SUPPLY;
+                break;
+                
+            case RobotState::OCCUPYING_SUPPLY:
+                std::cout << "State: OCCUPYING_SUPPLY → Occupying supply " 
+                          << current_target_idx << "\n";
+                occupy_supply(current_target_idx);
+                
+                // 检查是否完成所有物资点
+                if (status.occupied_count >= 4) {
+                    std::cout << "All supplies occupied!\n";
+                    if (status.robot_hp > 1) {
+                        current_state = RobotState::ATTACKING;
+                    } else {
+                        current_state = RobotState::DEFENDING;
+                    }
+                } else {
+                    current_state = RobotState::RETURNING_HOME;
+                }
+                break;
+                
+            case RobotState::RETURNING_HOME:
+                std::cout << "State: RETURNING_HOME → Returning to base\n";
+                move_base(home_position);
+                
+                if (status.at_home) {
+                    std::cout << "Reached home base. Pausing...\n";
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    
+                    // 寻找下一个未占领的物资点
+                    current_target_idx = -1;
+                    for (int i = 0; i < supply_points.size(); ++i) {
+                        if (!supply_points[i].occupied) {
+                            current_target_idx = i;
+                            break;
+                        }
+                    }
+                    
+                    if (current_target_idx >= 0) {
+                        std::cout << "Next target: Supply " << current_target_idx << "\n";
+                        current_state = RobotState::MOVING_TO_SUPPLY;
+                    } else {
+                        std::cout << "No more supplies to occupy!\n";
+                    }
+                }
+                break;
+                
+            case RobotState::ATTACKING:
+                if (status.robot_hp <= 1) {
+                    std::cout << "HP too low! Switching to DEFEND\n";
+                    current_state = RobotState::DEFENDING;
+                } else if (status.enemy_detected) {
+                    std::cout << "State: ATTACKING → Engaging enemy\n";
+                    attack_enemy();
+                } else {
+                    std::cout << "State: ATTACKING → Searching for enemy\n";
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+                break;
+                
+            case RobotState::DEFENDING:
+                if (status.robot_hp > 1 && status.occupied_count >= 4) {
+                    std::cout << "HP recovered! Switching to ATTACK\n";
+                    current_state = RobotState::ATTACKING;
+                } else {
+                    std::cout << "State: DEFENDING → Evading enemy\n";
+                    evade_enemy();
+                }
+                break;
+        }
+    }
+    
+    // 获取当前状态（用于监控）
+    RobotState get_current_state() const {
+        return current_state;
+    }
+    
+    // 修改血量（用于模拟事件）
+    void set_robot_hp(int hp) {
+        status.robot_hp = hp;
+    }
+    
+    // 设置敌人检测状态
+    void set_enemy_detected(bool detected) {
+        status.enemy_detected = detected;
+    }
+};
+
+int main() {
+    DecisionStateMachine fsm;
+    
+    // 模拟运行20个周期
+    for (int i = 0; i < 20; ++i) {
+        std::cout << "\n--- Cycle " << (i+1) << " ---\n";
+        fsm.run_cycle();
+        
+        // 模拟事件
+        if (i == 10) {
+            fsm.set_robot_hp(1);
+            std::cout << "ALERT: Robot HP dropped to 1!\n";
+        }
+        
+        if (i > 12) {
+            fsm.set_enemy_detected(true);
+        }
+        
+        // 添加一些延迟模拟真实循环
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+    
+    return 0;
+}
